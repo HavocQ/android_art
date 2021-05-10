@@ -1375,7 +1375,7 @@ JDWP::JdwpError Dbg::CreateObject(JDWP::RefTypeId class_id, JDWP::ObjectId* new_
   if (c->IsStringClass()) {
     // Special case for java.lang.String.
     gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
-    new_object = mirror::String::AllocEmptyString<true>(self, allocator_type);
+    new_object = mirror::String::AllocEmptyString(self, allocator_type);
   } else {
     new_object = c->AllocObject(self);
   }
@@ -1404,7 +1404,7 @@ JDWP::JdwpError Dbg::CreateArrayObject(JDWP::RefTypeId array_class_id, uint32_t 
   Thread* self = Thread::Current();
   gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
   ObjPtr<mirror::Array> new_array =
-      mirror::Array::Alloc<true>(self, c, length, c->GetComponentSizeShift(), allocator_type);
+      mirror::Array::Alloc(self, c, length, c->GetComponentSizeShift(), allocator_type);
   if (new_array == nullptr) {
     DCHECK(self->IsExceptionPending());
     self->ClearException();
@@ -4433,16 +4433,16 @@ JDWP::JdwpState* Dbg::GetJdwpState() {
 int Dbg::DdmHandleHpifChunk(HpifWhen when) {
   if (when == HPIF_WHEN_NOW) {
     DdmSendHeapInfo(when);
-    return true;
+    return 1;
   }
 
   if (when != HPIF_WHEN_NEVER && when != HPIF_WHEN_NEXT_GC && when != HPIF_WHEN_EVERY_GC) {
     LOG(ERROR) << "invalid HpifWhen value: " << static_cast<int>(when);
-    return false;
+    return 0;
   }
 
   gDdmHpifWhen = when;
-  return true;
+  return 1;
 }
 
 bool Dbg::DdmHandleHpsgNhsgChunk(Dbg::HpsgWhen when, Dbg::HpsgWhat what, bool native) {

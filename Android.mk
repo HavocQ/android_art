@@ -342,7 +342,7 @@ include $(CLEAR_VARS)
 # - if `PRODUCT_ART_TARGET_INCLUDE_DEBUG_BUILD` is set to `true`, the
 #   build will include the debug module (whatever the build variant).
 
-art_target_include_debug_build := $(PRODUCT_ART_TARGET_INCLUDE_DEBUG_BUILD)
+art_target_include_debug_build := false
 ifneq (false,$(art_target_include_debug_build))
   ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
     art_target_include_debug_build := true
@@ -371,8 +371,10 @@ include $(BUILD_PHONY_PACKAGE)
 include $(CLEAR_VARS)
 LOCAL_MODULE := com.android.runtime
 LOCAL_IS_HOST_MODULE := true
+ifneq ($(DISABLE_APEX_TEST_MODULE),true)
 ifneq ($(HOST_OS),darwin)
   LOCAL_REQUIRED_MODULES += $(APEX_TEST_MODULE)
+endif
 endif
 include $(BUILD_PHONY_PACKAGE)
 

@@ -3708,7 +3708,6 @@ class ReferenceMapVisitor : public StackVisitor {
     VisitDeclaringClass(m);
     DCHECK(m != nullptr);
     size_t num_regs = shadow_frame->NumberOfVRegs();
-    DCHECK(m->IsNative() || shadow_frame->HasReferenceArray());
     // handle scope for JNI or References for interpreter.
     for (size_t reg = 0; reg < num_regs; ++reg) {
       mirror::Object* ref = shadow_frame->GetVRegReference(reg);
@@ -3781,9 +3780,9 @@ class ReferenceMapVisitor : public StackVisitor {
       StackReference<mirror::Object>* vreg_base =
           reinterpret_cast<StackReference<mirror::Object>*>(cur_quick_frame);
       uintptr_t native_pc_offset = method_header->NativeQuickPcOffset(GetCurrentQuickFramePc());
-      CodeInfo code_info(method_header, kPrecise
-          ? CodeInfo::DecodeFlags::AllTables  // We will need dex register maps.
-          : CodeInfo::DecodeFlags::GcMasksOnly);
+      CodeInfo code_info = kPrecise
+          ? CodeInfo(method_header)  // We will need dex register maps.
+          : CodeInfo::DecodeGcMasksOnly(method_header);
       StackMap map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
       DCHECK(map.IsValid());
 
@@ -3889,6 +3888,7 @@ class ReferenceMapVisitor : public StackVisitor {
             code_info(_code_info),
             dex_register_map(code_info.GetDexRegisterMapOf(map)),
             visitor(_visitor) {
+        DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
       }
 
       // TODO: If necessary, we should consider caching a reverse map instead of the linear

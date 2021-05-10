@@ -78,6 +78,15 @@
     .cfi_adjust_cfa_offset -(\frame_adjustment)
 .endm
 
+.macro LOAD_RUNTIME_INSTANCE reg
+#if __has_feature(hwaddress_sanitizer) && __clang_major__ >= 10
+    adrp xIP0, :pg_hi21_nc:_ZN3art7Runtime9instance_E
+#else
+    adrp xIP0, _ZN3art7Runtime9instance_E
+#endif
+    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+.endm
+
     /*
      * Macro that sets up the callee save frame to conform with
      * Runtime::CreateCalleeSaveMethod(kSaveAllCalleeSaves)
@@ -85,8 +94,7 @@
 .macro SETUP_SAVE_ALL_CALLEE_SAVES_FRAME
     // art::Runtime* xIP0 = art::Runtime::instance_;
     // Our registers aren't intermixed - just spill in order.
-    adrp xIP0, _ZN3art7Runtime9instance_E
-    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+    LOAD_RUNTIME_INSTANCE xIP0
 
     // ArtMethod* xIP0 = Runtime::instance_->callee_save_methods_[kSaveAllCalleeSaves];
     ldr xIP0, [xIP0, RUNTIME_SAVE_ALL_CALLEE_SAVES_METHOD_OFFSET]
@@ -127,8 +135,7 @@
 .macro SETUP_SAVE_REFS_ONLY_FRAME
     // art::Runtime* xIP0 = art::Runtime::instance_;
     // Our registers aren't intermixed - just spill in order.
-    adrp xIP0, _ZN3art7Runtime9instance_E
-    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+    LOAD_RUNTIME_INSTANCE xIP0
 
     // ArtMethod* xIP0 = Runtime::instance_->callee_save_methods_[kSaveRefOnly];
     ldr xIP0, [xIP0, RUNTIME_SAVE_REFS_ONLY_METHOD_OFFSET]
@@ -225,8 +232,7 @@
 .macro SETUP_SAVE_REFS_AND_ARGS_FRAME
     // art::Runtime* xIP0 = art::Runtime::instance_;
     // Our registers aren't intermixed - just spill in order.
-    adrp xIP0, _ZN3art7Runtime9instance_E
-    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+    LOAD_RUNTIME_INSTANCE xIP0
 
     // ArtMethod* xIP0 = Runtime::instance_->callee_save_methods_[kSaveRefAndArgs];
     ldr xIP0, [xIP0, RUNTIME_SAVE_REFS_AND_ARGS_METHOD_OFFSET]
@@ -323,8 +329,7 @@
     SAVE_TWO_REGS x27, x28, 480
 
     // art::Runtime* xIP0 = art::Runtime::instance_;
-    adrp xIP0, _ZN3art7Runtime9instance_E
-    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+    LOAD_RUNTIME_INSTANCE xIP0
 
     // ArtMethod* xIP0 = Runtime::instance_->callee_save_methods_[kSaveEverything];
     ldr xIP0, [xIP0, \runtime_method_offset]
@@ -2467,6 +2472,17 @@ ENTRY art_quick_indexof
     ret
 #endif
 END art_quick_indexof
+
+    .extern artStringBuilderAppend
+ENTRY art_quick_string_builder_append
+    SETUP_SAVE_REFS_ONLY_FRAME          // save callee saves in case of GC
+    add    x1, sp, #(FRAME_SIZE_SAVE_REFS_ONLY + __SIZEOF_POINTER__)  // pass args
+    mov    x2, xSELF                    // pass Thread::Current
+    bl     artStringBuilderAppend       // (uint32_t, const unit32_t*, Thread*)
+    RESTORE_SAVE_REFS_ONLY_FRAME
+    REFRESH_MARKING_REGISTER
+    RETURN_IF_RESULT_IS_NON_ZERO_OR_DELIVER
+END art_quick_string_builder_append
 
     /*
      * Create a function `name` calling the ReadBarrier::Mark routine,

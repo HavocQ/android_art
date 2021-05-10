@@ -658,8 +658,14 @@ void Runtime::PreZygoteFork() {
 }
 
 void Runtime::PostZygoteFork() {
-  if (GetJit() != nullptr) {
-    GetJit()->PostZygoteFork();
+  jit::Jit* jit = GetJit();
+  if (jit != nullptr) {
+    jit->PostZygoteFork();
+    // Ensure that the threads in the JIT pool have been created with the right
+    // priority.
+    if (kIsDebugBuild && jit->GetThreadPool() != nullptr) {
+      jit->GetThreadPool()->CheckPthreadPriority(jit->GetThreadPoolPthreadPriority());
+    }
   }
 }
 
@@ -1101,7 +1107,7 @@ static inline void CreatePreAllocatedException(Thread* self,
   CHECK(klass != nullptr);
   gc::AllocatorType allocator_type = runtime->GetHeap()->GetCurrentAllocator();
   ObjPtr<mirror::Throwable> exception_object = ObjPtr<mirror::Throwable>::DownCast(
-      klass->Alloc</* kIsInstrumented= */ true>(self, allocator_type));
+      klass->Alloc(self, allocator_type));
   CHECK(exception_object != nullptr);
   *exception = GcRoot<mirror::Throwable>(exception_object);
   // Initialize the "detailMessage" field.

@@ -47,7 +47,6 @@ namespace vixl32 = vixl::aarch32;
 using namespace vixl32;  // NOLINT(build/namespaces)
 
 using helpers::DRegisterFrom;
-using helpers::DWARFReg;
 using helpers::HighRegisterFrom;
 using helpers::InputDRegisterAt;
 using helpers::InputOperandAt;
@@ -1856,8 +1855,6 @@ CodeGeneratorARMVIXL::CodeGeneratorARMVIXL(HGraph* graph,
       instruction_visitor_(graph, this),
       move_resolver_(graph->GetAllocator(), this),
       assembler_(graph->GetAllocator()),
-      uint32_literals_(std::less<uint32_t>(),
-                       graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_method_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       method_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
@@ -1865,7 +1862,10 @@ CodeGeneratorARMVIXL::CodeGeneratorARMVIXL(HGraph* graph,
       boot_image_string_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       string_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_intrinsic_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
+      call_entrypoint_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       baker_read_barrier_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
+      uint32_literals_(std::less<uint32_t>(),
+                       graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       jit_string_patches_(StringReferenceValueComparator(),
                           graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       jit_class_patches_(TypeReferenceValueComparator(),
@@ -2060,10 +2060,10 @@ InstructionCodeGeneratorARMVIXL::InstructionCodeGeneratorARMVIXL(HGraph* graph,
 
 void CodeGeneratorARMVIXL::ComputeSpillMask() {
   core_spill_mask_ = allocated_registers_.GetCoreRegisters() & core_callee_save_mask_;
-  DCHECK_NE(core_spill_mask_, 0u) << "At least the return address register must be saved";
-  // There is no easy instruction to restore just the PC on thumb2. We spill and
-  // restore another arbitrary register.
-  core_spill_mask_ |= (1 << kCoreAlwaysSpillRegister.GetCode());
+  DCHECK_NE(core_spill_mask_ & (1u << kLrCode), 0u)
+      << "At least the return address register must be saved";
+  // 16-bit PUSH/POP (T1) can save/restore just the LR/PC.
+  DCHECK(GetVIXLAssembler()->IsUsingT32());
   fpu_spill_mask_ = allocated_registers_.GetFloatingPointRegisters() & fpu_callee_save_mask_;
   // We use vpush and vpop for saving and restoring floating point registers, which take
   // a SRegister and the number of registers to save/restore after that SRegister. We
@@ -2125,32 +2125,66 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
     RecordPcInfo(nullptr, 0);
   }
 
-  __ Push(RegisterList(core_spill_mask_));
-  GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(core_spill_mask_));
-  GetAssembler()->cfi().RelOffsetForMany(DWARFReg(kMethodRegister),
-                                         0,
-                                         core_spill_mask_,
-                                         kArmWordSize);
-  if (fpu_spill_mask_ != 0) {
-    uint32_t first = LeastSignificantBit(fpu_spill_mask_);
+  uint32_t frame_size = GetFrameSize();
+  uint32_t core_spills_offset = frame_size - GetCoreSpillSize();
+  uint32_t fp_spills_offset = frame_size - FrameEntrySpillSize();
+  if ((fpu_spill_mask_ == 0u || IsPowerOfTwo(fpu_spill_mask_)) &&
+      core_spills_offset <= 3u * kArmWordSize) {
+    // Do a single PUSH for core registers including the method and up to two
+    // filler registers. Then store the single FP spill if any.
+    // (The worst case is when the method is not required and we actually
+    // store 3 extra registers but they are stored in the same properly
+    // aligned 16-byte chunk where we're already writing anyway.)
+    DCHECK_EQ(kMethodRegister.GetCode(), 0u);
+    uint32_t extra_regs = MaxInt<uint32_t>(core_spills_offset / kArmWordSize);
+    DCHECK_LT(MostSignificantBit(extra_regs), LeastSignificantBit(core_spill_mask_));
+    __ Push(RegisterList(core_spill_mask_ | extra_regs));
+    GetAssembler()->cfi().AdjustCFAOffset(frame_size);
+    GetAssembler()->cfi().RelOffsetForMany(DWARFReg(kMethodRegister),
+                                           core_spills_offset,
+                                           core_spill_mask_,
+                                           kArmWordSize);
+    if (fpu_spill_mask_ != 0u) {
+      DCHECK(IsPowerOfTwo(fpu_spill_mask_));
+      vixl::aarch32::SRegister sreg(LeastSignificantBit(fpu_spill_mask_));
+      GetAssembler()->StoreSToOffset(sreg, sp, fp_spills_offset);
+      GetAssembler()->cfi().RelOffset(DWARFReg(sreg), /*offset=*/ fp_spills_offset);
+    }
+  } else {
+    __ Push(RegisterList(core_spill_mask_));
+    GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(core_spill_mask_));
+    GetAssembler()->cfi().RelOffsetForMany(DWARFReg(kMethodRegister),
+                                           /*offset=*/ 0,
+                                           core_spill_mask_,
+                                           kArmWordSize);
+    if (fpu_spill_mask_ != 0) {
+      uint32_t first = LeastSignificantBit(fpu_spill_mask_);
 
-    // Check that list is contiguous.
-    DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
+      // Check that list is contiguous.
+      DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
 
-    __ Vpush(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
-    GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(fpu_spill_mask_));
-    GetAssembler()->cfi().RelOffsetForMany(DWARFReg(s0), 0, fpu_spill_mask_, kArmWordSize);
-  }
+      __ Vpush(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
+      GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(fpu_spill_mask_));
+      GetAssembler()->cfi().RelOffsetForMany(DWARFReg(s0),
+                                             /*offset=*/ 0,
+                                             fpu_spill_mask_,
+                                             kArmWordSize);
+    }
 
-  int adjust = GetFrameSize() - FrameEntrySpillSize();
-  __ Sub(sp, sp, adjust);
-  GetAssembler()->cfi().AdjustCFAOffset(adjust);
-
-  // Save the current method if we need it. Note that we do not
-  // do this in HCurrentMethod, as the instruction might have been removed
-  // in the SSA graph.
-  if (RequiresCurrentMethod()) {
-    GetAssembler()->StoreToOffset(kStoreWord, kMethodRegister, sp, 0);
+    // Adjust SP and save the current method if we need it. Note that we do
+    // not save the method in HCurrentMethod, as the instruction might have
+    // been removed in the SSA graph.
+    if (RequiresCurrentMethod() && fp_spills_offset <= 3 * kArmWordSize) {
+      DCHECK_EQ(kMethodRegister.GetCode(), 0u);
+      __ Push(RegisterList(MaxInt<uint32_t>(fp_spills_offset / kArmWordSize)));
+      GetAssembler()->cfi().AdjustCFAOffset(fp_spills_offset);
+    } else {
+      __ Sub(sp, sp, dchecked_integral_cast<int32_t>(fp_spills_offset));
+      GetAssembler()->cfi().AdjustCFAOffset(fp_spills_offset);
+      if (RequiresCurrentMethod()) {
+        GetAssembler()->StoreToOffset(kStoreWord, kMethodRegister, sp, 0);
+      }
+    }
   }
 
   if (GetGraph()->HasShouldDeoptimizeFlag()) {
@@ -2169,27 +2203,55 @@ void CodeGeneratorARMVIXL::GenerateFrameExit() {
     __ Bx(lr);
     return;
   }
-  GetAssembler()->cfi().RememberState();
-  int adjust = GetFrameSize() - FrameEntrySpillSize();
-  __ Add(sp, sp, adjust);
-  GetAssembler()->cfi().AdjustCFAOffset(-adjust);
-  if (fpu_spill_mask_ != 0) {
-    uint32_t first = LeastSignificantBit(fpu_spill_mask_);
 
-    // Check that list is contiguous.
-    DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
-
-    __ Vpop(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
-    GetAssembler()->cfi().AdjustCFAOffset(
-        -static_cast<int>(kArmWordSize) * POPCOUNT(fpu_spill_mask_));
-    GetAssembler()->cfi().RestoreMany(DWARFReg(vixl32::SRegister(0)), fpu_spill_mask_);
-  }
   // Pop LR into PC to return.
   DCHECK_NE(core_spill_mask_ & (1 << kLrCode), 0U);
   uint32_t pop_mask = (core_spill_mask_ & (~(1 << kLrCode))) | 1 << kPcCode;
-  __ Pop(RegisterList(pop_mask));
-  GetAssembler()->cfi().RestoreState();
-  GetAssembler()->cfi().DefCFAOffset(GetFrameSize());
+
+  uint32_t frame_size = GetFrameSize();
+  uint32_t core_spills_offset = frame_size - GetCoreSpillSize();
+  uint32_t fp_spills_offset = frame_size - FrameEntrySpillSize();
+  if ((fpu_spill_mask_ == 0u || IsPowerOfTwo(fpu_spill_mask_)) &&
+      // r4 is blocked by TestCodeGeneratorARMVIXL used by some tests.
+      core_spills_offset <= (blocked_core_registers_[r4.GetCode()] ? 2u : 3u) * kArmWordSize) {
+    // Load the FP spill if any and then do a single POP including the method
+    // and up to two filler registers. If we have no FP spills, this also has
+    // the advantage that we do not need to emit CFI directives.
+    if (fpu_spill_mask_ != 0u) {
+      DCHECK(IsPowerOfTwo(fpu_spill_mask_));
+      vixl::aarch32::SRegister sreg(LeastSignificantBit(fpu_spill_mask_));
+      GetAssembler()->cfi().RememberState();
+      GetAssembler()->LoadSFromOffset(sreg, sp, fp_spills_offset);
+      GetAssembler()->cfi().Restore(DWARFReg(sreg));
+    }
+    // Clobber registers r2-r4 as they are caller-save in ART managed ABI and
+    // never hold the return value.
+    uint32_t extra_regs = MaxInt<uint32_t>(core_spills_offset / kArmWordSize) << r2.GetCode();
+    DCHECK_EQ(extra_regs & kCoreCalleeSaves.GetList(), 0u);
+    DCHECK_LT(MostSignificantBit(extra_regs), LeastSignificantBit(pop_mask));
+    __ Pop(RegisterList(pop_mask | extra_regs));
+    if (fpu_spill_mask_ != 0u) {
+      GetAssembler()->cfi().RestoreState();
+    }
+  } else {
+    GetAssembler()->cfi().RememberState();
+    __ Add(sp, sp, fp_spills_offset);
+    GetAssembler()->cfi().AdjustCFAOffset(-dchecked_integral_cast<int32_t>(fp_spills_offset));
+    if (fpu_spill_mask_ != 0) {
+      uint32_t first = LeastSignificantBit(fpu_spill_mask_);
+
+      // Check that list is contiguous.
+      DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
+
+      __ Vpop(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
+      GetAssembler()->cfi().AdjustCFAOffset(
+          -static_cast<int>(kArmWordSize) * POPCOUNT(fpu_spill_mask_));
+      GetAssembler()->cfi().RestoreMany(DWARFReg(vixl32::SRegister(0)), fpu_spill_mask_);
+    }
+    __ Pop(RegisterList(pop_mask));
+    GetAssembler()->cfi().RestoreState();
+    GetAssembler()->cfi().DefCFAOffset(GetFrameSize());
+  }
 }
 
 void CodeGeneratorARMVIXL::Bind(HBasicBlock* block) {
@@ -2383,15 +2445,31 @@ void CodeGeneratorARMVIXL::InvokeRuntime(QuickEntrypointEnum entrypoint,
                                          uint32_t dex_pc,
                                          SlowPathCode* slow_path) {
   ValidateInvokeRuntime(entrypoint, instruction, slow_path);
-  __ Ldr(lr, MemOperand(tr, GetThreadOffset<kArmPointerSize>(entrypoint).Int32Value()));
-  // Ensure the pc position is recorded immediately after the `blx` instruction.
-  // blx in T32 has only 16bit encoding that's why a stricter check for the scope is used.
-  ExactAssemblyScope aas(GetVIXLAssembler(),
-                         vixl32::k16BitT32InstructionSizeInBytes,
-                         CodeBufferCheckScope::kExactSize);
-  __ blx(lr);
-  if (EntrypointRequiresStackMap(entrypoint)) {
-    RecordPcInfo(instruction, dex_pc, slow_path);
+
+  ThreadOffset32 entrypoint_offset = GetThreadOffset<kArmPointerSize>(entrypoint);
+  // Reduce code size for AOT by using shared trampolines for slow path runtime calls across the
+  // entire oat file. This adds an extra branch and we do not want to slow down the main path.
+  // For JIT, thunk sharing is per-method, so the gains would be smaller or even negative.
+  if (slow_path == nullptr || Runtime::Current()->UseJitCompilation()) {
+    __ Ldr(lr, MemOperand(tr, entrypoint_offset.Int32Value()));
+    // Ensure the pc position is recorded immediately after the `blx` instruction.
+    // blx in T32 has only 16bit encoding that's why a stricter check for the scope is used.
+    ExactAssemblyScope aas(GetVIXLAssembler(),
+                           vixl32::k16BitT32InstructionSizeInBytes,
+                           CodeBufferCheckScope::kExactSize);
+    __ blx(lr);
+    if (EntrypointRequiresStackMap(entrypoint)) {
+      RecordPcInfo(instruction, dex_pc, slow_path);
+    }
+  } else {
+    // Ensure the pc position is recorded immediately after the `bl` instruction.
+    ExactAssemblyScope aas(GetVIXLAssembler(),
+                           vixl32::k32BitT32InstructionSizeInBytes,
+                           CodeBufferCheckScope::kExactSize);
+    EmitEntrypointThunkCall(entrypoint_offset);
+    if (EntrypointRequiresStackMap(entrypoint)) {
+      RecordPcInfo(instruction, dex_pc, slow_path);
+    }
   }
 }
 
@@ -3975,27 +4053,73 @@ void InstructionCodeGeneratorARMVIXL::DivRemByPowerOfTwo(HBinaryOperation* instr
 
   vixl32::Register out = OutputRegister(instruction);
   vixl32::Register dividend = InputRegisterAt(instruction, 0);
-  vixl32::Register temp = RegisterFrom(locations->GetTemp(0));
   int32_t imm = Int32ConstantFrom(second);
   uint32_t abs_imm = static_cast<uint32_t>(AbsOrMin(imm));
   int ctz_imm = CTZ(abs_imm);
 
-  if (ctz_imm == 1) {
-    __ Lsr(temp, dividend, 32 - ctz_imm);
-  } else {
-    __ Asr(temp, dividend, 31);
-    __ Lsr(temp, temp, 32 - ctz_imm);
-  }
-  __ Add(out, temp, dividend);
-
-  if (instruction->IsDiv()) {
-    __ Asr(out, out, ctz_imm);
+  auto generate_div_code = [this, imm, ctz_imm](vixl32::Register out, vixl32::Register in) {
+    __ Asr(out, in, ctz_imm);
     if (imm < 0) {
       __ Rsb(out, out, 0);
     }
+  };
+
+  if (HasNonNegativeOrMinIntInputAt(instruction, 0)) {
+    // No need to adjust the result for non-negative dividends or the INT32_MIN dividend.
+    // NOTE: The generated code for HDiv/HRem correctly works for the INT32_MIN dividend:
+    //   imm == 2
+    //     HDiv
+    //      add out, dividend(0x80000000), dividend(0x80000000), lsr #31 => out = 0x80000001
+    //      asr out, out(0x80000001), #1 => out = 0xc0000000
+    //      This is the same as 'asr out, dividend(0x80000000), #1'
+    //
+    //   imm > 2
+    //     HDiv
+    //      asr out, dividend(0x80000000), #31 => out = -1
+    //      add out, dividend(0x80000000), out(-1), lsr #(32 - ctz_imm) => out = 0b10..01..1,
+    //          where the number of the rightmost 1s is ctz_imm.
+    //      asr out, out(0b10..01..1), #ctz_imm => out = 0b1..10..0, where the number of the
+    //          leftmost 1s is ctz_imm + 1.
+    //      This is the same as 'asr out, dividend(0x80000000), #ctz_imm'.
+    //
+    //   imm == INT32_MIN
+    //     HDiv
+    //      asr out, dividend(0x80000000), #31 => out = -1
+    //      add out, dividend(0x80000000), out(-1), lsr #1 => out = 0xc0000000
+    //      asr out, out(0xc0000000), #31 => out = -1
+    //      rsb out, out(-1), #0 => out = 1
+    //      This is the same as
+    //        asr out, dividend(0x80000000), #31
+    //        rsb out, out, #0
+    //
+    //
+    //   INT_MIN % imm must be 0 for any imm of power 2. 'and' and 'ubfx' work only with bits
+    //   0..30 of a dividend. For INT32_MIN those bits are zeros. So 'and' and 'ubfx' always
+    //   produce zero.
+    if (instruction->IsDiv()) {
+      generate_div_code(out, dividend);
+    } else {
+      if (GetVIXLAssembler()->IsModifiedImmediate(abs_imm - 1)) {
+        __ And(out, dividend, abs_imm - 1);
+      } else {
+        __ Ubfx(out, dividend, 0, ctz_imm);
+      }
+      return;
+    }
   } else {
-    __ Ubfx(out, out, 0, ctz_imm);
-    __ Sub(out, out, temp);
+    vixl32::Register add_right_input = dividend;
+    if (ctz_imm > 1) {
+      __ Asr(out, dividend, 31);
+      add_right_input = out;
+    }
+    __ Add(out, dividend, Operand(add_right_input, vixl32::LSR, 32 - ctz_imm));
+
+    if (instruction->IsDiv()) {
+      generate_div_code(out, out);
+    } else {
+      __ Bfc(out, 0, ctz_imm);
+      __ Sub(out, dividend, out);
+    }
   }
 }
 
@@ -4017,27 +4141,70 @@ void InstructionCodeGeneratorARMVIXL::GenerateDivRemWithAnyConstant(HBinaryOpera
   int shift;
   CalculateMagicAndShiftForDivRem(imm, /* is_long= */ false, &magic, &shift);
 
-  // TODO(VIXL): Change the static cast to Operand::From() after VIXL is fixed.
-  __ Mov(temp1, static_cast<int32_t>(magic));
-  __ Smull(temp2, temp1, dividend, temp1);
+  auto generate_unsigned_div_code =[this, magic, shift](vixl32::Register out,
+                                                        vixl32::Register dividend,
+                                                        vixl32::Register temp1,
+                                                        vixl32::Register temp2) {
+    // TODO(VIXL): Change the static cast to Operand::From() after VIXL is fixed.
+    __ Mov(temp1, static_cast<int32_t>(magic));
+    if (magic > 0 && shift == 0) {
+      __ Smull(temp2, out, dividend, temp1);
+    } else {
+      __ Smull(temp2, temp1, dividend, temp1);
+      if (magic < 0) {
+        // The negative magic M = static_cast<int>(m) means that the multiplier m is greater
+        // than INT32_MAX. In such a case shift is never 0.
+        // Proof:
+        //   m = (2^p + d - 2^p % d) / d, where p = 32 + shift, d > 2
+        //
+        //   If shift == 0, m = (2^32 + d - 2^32 % d) / d =
+        //   = (2^32 + d - (2^32 - (2^32 / d) * d)) / d =
+        //   = (d + (2^32 / d) * d) / d = 1 + (2^32 / d), here '/' is the integer division.
+        //
+        //   1 + (2^32 / d) is decreasing when d is increasing.
+        //   The maximum is 1 431 655 766, when d == 3. This value is less than INT32_MAX.
+        //   the minimum is 3, when d = 2^31 -1.
+        //   So for all values of d in [3, INT32_MAX] m with p == 32 is in [3, INT32_MAX) and
+        //   is never less than 0.
+        __ Add(temp1, temp1, dividend);
+      }
+      DCHECK_NE(shift, 0);
+      __ Lsr(out, temp1, shift);
+    }
+  };
 
-  if (imm > 0 && magic < 0) {
-    __ Add(temp1, temp1, dividend);
-  } else if (imm < 0 && magic > 0) {
-    __ Sub(temp1, temp1, dividend);
-  }
-
-  if (shift != 0) {
-    __ Asr(temp1, temp1, shift);
-  }
-
-  if (instruction->IsDiv()) {
-    __ Sub(out, temp1, Operand(temp1, vixl32::Shift(ASR), 31));
+  if (imm > 0 && HasNonNegativeInputAt(instruction, 0)) {
+    // No need to adjust the result for a non-negative dividend and a positive divisor.
+    if (instruction->IsDiv()) {
+      generate_unsigned_div_code(out, dividend, temp1, temp2);
+    } else {
+      generate_unsigned_div_code(temp1, dividend, temp1, temp2);
+      __ Mov(temp2, imm);
+      __ Mls(out, temp1, temp2, dividend);
+    }
   } else {
-    __ Sub(temp1, temp1, Operand(temp1, vixl32::Shift(ASR), 31));
-    // TODO: Strength reduction for mls.
-    __ Mov(temp2, imm);
-    __ Mls(out, temp1, temp2, dividend);
+    // TODO(VIXL): Change the static cast to Operand::From() after VIXL is fixed.
+    __ Mov(temp1, static_cast<int32_t>(magic));
+    __ Smull(temp2, temp1, dividend, temp1);
+
+    if (imm > 0 && magic < 0) {
+      __ Add(temp1, temp1, dividend);
+    } else if (imm < 0 && magic > 0) {
+      __ Sub(temp1, temp1, dividend);
+    }
+
+    if (shift != 0) {
+      __ Asr(temp1, temp1, shift);
+    }
+
+    if (instruction->IsDiv()) {
+      __ Sub(out, temp1, Operand(temp1, vixl32::Shift(ASR), 31));
+    } else {
+      __ Sub(temp1, temp1, Operand(temp1, vixl32::Shift(ASR), 31));
+      // TODO: Strength reduction for mls.
+      __ Mov(temp2, imm);
+      __ Mls(out, temp1, temp2, dividend);
+    }
   }
 }
 
@@ -4082,16 +4249,20 @@ void LocationsBuilderARMVIXL::VisitDiv(HDiv* div) {
       if (div->InputAt(1)->IsConstant()) {
         locations->SetInAt(0, Location::RequiresRegister());
         locations->SetInAt(1, Location::ConstantLocation(div->InputAt(1)->AsConstant()));
-        locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
         int32_t value = Int32ConstantFrom(div->InputAt(1));
+        Location::OutputOverlap out_overlaps = Location::kNoOutputOverlap;
         if (value == 1 || value == 0 || value == -1) {
           // No temp register required.
+        } else if (IsPowerOfTwo(AbsOrMin(value)) &&
+                   value != 2 &&
+                   value != -2 &&
+                   !HasNonNegativeOrMinIntInputAt(div, 0)) {
+          // The "out" register is used as a temporary, so it overlaps with the inputs.
+          out_overlaps = Location::kOutputOverlap;
         } else {
-          locations->AddTemp(Location::RequiresRegister());
-          if (!IsPowerOfTwo(AbsOrMin(value))) {
-            locations->AddTemp(Location::RequiresRegister());
-          }
+          locations->AddRegisterTemps(2);
         }
+        locations->SetOut(Location::RequiresRegister(), out_overlaps);
       } else if (codegen_->GetInstructionSetFeatures().HasDivideInstruction()) {
         locations->SetInAt(0, Location::RequiresRegister());
         locations->SetInAt(1, Location::RequiresRegister());
@@ -4195,16 +4366,17 @@ void LocationsBuilderARMVIXL::VisitRem(HRem* rem) {
       if (rem->InputAt(1)->IsConstant()) {
         locations->SetInAt(0, Location::RequiresRegister());
         locations->SetInAt(1, Location::ConstantLocation(rem->InputAt(1)->AsConstant()));
-        locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
         int32_t value = Int32ConstantFrom(rem->InputAt(1));
+        Location::OutputOverlap out_overlaps = Location::kNoOutputOverlap;
         if (value == 1 || value == 0 || value == -1) {
           // No temp register required.
+        } else if (IsPowerOfTwo(AbsOrMin(value)) && !HasNonNegativeOrMinIntInputAt(rem, 0)) {
+          // The "out" register is used as a temporary, so it overlaps with the inputs.
+          out_overlaps = Location::kOutputOverlap;
         } else {
-          locations->AddTemp(Location::RequiresRegister());
-          if (!IsPowerOfTwo(AbsOrMin(value))) {
-            locations->AddTemp(Location::RequiresRegister());
-          }
+          locations->AddRegisterTemps(2);
         }
+        locations->SetOut(Location::RequiresRegister(), out_overlaps);
       } else if (codegen_->GetInstructionSetFeatures().HasDivideInstruction()) {
         locations->SetInAt(0, Location::RequiresRegister());
         locations->SetInAt(1, Location::RequiresRegister());
@@ -5722,6 +5894,15 @@ void InstructionCodeGeneratorARMVIXL::VisitStaticFieldSet(HStaticFieldSet* instr
   HandleFieldSet(instruction, instruction->GetFieldInfo(), instruction->GetValueCanBeNull());
 }
 
+void LocationsBuilderARMVIXL::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
+  codegen_->CreateStringBuilderAppendLocations(instruction, LocationFrom(r0));
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
+  __ Mov(r0, instruction->GetFormat()->GetValue());
+  codegen_->InvokeRuntime(kQuickStringBuilderAppend, instruction, instruction->GetDexPc());
+}
+
 void LocationsBuilderARMVIXL::VisitUnresolvedInstanceFieldGet(
     HUnresolvedInstanceFieldGet* instruction) {
   FieldAccessCallingConventionARMVIXL calling_convention;
@@ -6168,13 +6349,11 @@ void LocationsBuilderARMVIXL::VisitArraySet(HArraySet* instruction) {
 
   bool needs_write_barrier =
       CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
-  bool may_need_runtime_call_for_type_check = instruction->NeedsTypeCheck();
+  bool needs_type_check = instruction->NeedsTypeCheck();
 
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
       instruction,
-      may_need_runtime_call_for_type_check ?
-          LocationSummary::kCallOnSlowPath :
-          LocationSummary::kNoCall);
+      needs_type_check ? LocationSummary::kCallOnSlowPath : LocationSummary::kNoCall);
 
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetInAt(1, Location::RegisterOrConstant(instruction->InputAt(1)));
@@ -6195,7 +6374,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
   vixl32::Register array = InputRegisterAt(instruction, 0);
   Location index = locations->InAt(1);
   DataType::Type value_type = instruction->GetComponentType();
-  bool may_need_runtime_call_for_type_check = instruction->NeedsTypeCheck();
+  bool needs_type_check = instruction->NeedsTypeCheck();
   bool needs_write_barrier =
       CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
   uint32_t data_offset =
@@ -6247,8 +6426,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
       if (instruction->InputAt(2)->IsNullConstant()) {
         // Just setting null.
         if (index.IsConstant()) {
-          size_t offset =
-              (Int32ConstantFrom(index) << TIMES_4) + data_offset;
+          size_t offset = (Int32ConstantFrom(index) << TIMES_4) + data_offset;
           GetAssembler()->StoreToOffset(kStoreWord, value, array, offset);
         } else {
           DCHECK(index.IsRegister()) << index;
@@ -6261,7 +6439,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
         // store instruction.
         codegen_->MaybeRecordImplicitNullCheck(instruction);
         DCHECK(!needs_write_barrier);
-        DCHECK(!may_need_runtime_call_for_type_check);
+        DCHECK(!needs_type_check);
         break;
       }
 
@@ -6270,36 +6448,21 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
       vixl32::Register temp1 = RegisterFrom(temp1_loc);
       Location temp2_loc = locations->GetTemp(1);
       vixl32::Register temp2 = RegisterFrom(temp2_loc);
-      uint32_t class_offset = mirror::Object::ClassOffset().Int32Value();
-      uint32_t super_offset = mirror::Class::SuperClassOffset().Int32Value();
-      uint32_t component_offset = mirror::Class::ComponentTypeOffset().Int32Value();
-      vixl32::Label done;
-      vixl32::Label* final_label = codegen_->GetFinalLabel(instruction, &done);
-      SlowPathCodeARMVIXL* slow_path = nullptr;
 
-      if (may_need_runtime_call_for_type_check) {
+      bool can_value_be_null = instruction->GetValueCanBeNull();
+      vixl32::Label do_store;
+      if (can_value_be_null) {
+        __ CompareAndBranchIfZero(value, &do_store, /* is_far_target= */ false);
+      }
+
+      SlowPathCodeARMVIXL* slow_path = nullptr;
+      if (needs_type_check) {
         slow_path = new (codegen_->GetScopedAllocator()) ArraySetSlowPathARMVIXL(instruction);
         codegen_->AddSlowPath(slow_path);
-        if (instruction->GetValueCanBeNull()) {
-          vixl32::Label non_zero;
-          __ CompareAndBranchIfNonZero(value, &non_zero);
-          if (index.IsConstant()) {
-            size_t offset =
-               (Int32ConstantFrom(index) << TIMES_4) + data_offset;
-            GetAssembler()->StoreToOffset(kStoreWord, value, array, offset);
-          } else {
-            DCHECK(index.IsRegister()) << index;
-            UseScratchRegisterScope temps(GetVIXLAssembler());
-            vixl32::Register temp = temps.Acquire();
-            __ Add(temp, array, data_offset);
-            codegen_->StoreToShiftedRegOffset(value_type, value_loc, temp, RegisterFrom(index));
-          }
-          // TODO(VIXL): Use a scope to ensure we record the pc info immediately after the preceding
-          // store instruction.
-          codegen_->MaybeRecordImplicitNullCheck(instruction);
-          __ B(final_label);
-          __ Bind(&non_zero);
-        }
+
+        const uint32_t class_offset = mirror::Object::ClassOffset().Int32Value();
+        const uint32_t super_offset = mirror::Class::SuperClassOffset().Int32Value();
+        const uint32_t component_offset = mirror::Class::ComponentTypeOffset().Int32Value();
 
         // Note that when read barriers are enabled, the type checks
         // are performed without read barriers.  This is fine, even in
@@ -6346,6 +6509,13 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
         }
       }
 
+      codegen_->MarkGCCard(temp1, temp2, array, value, /* can_be_null= */ false);
+
+      if (can_value_be_null) {
+        DCHECK(do_store.IsReferenced());
+        __ Bind(&do_store);
+      }
+
       vixl32::Register source = value;
       if (kPoisonHeapReferences) {
         // Note that in the case where `value` is a null reference,
@@ -6358,8 +6528,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
       }
 
       if (index.IsConstant()) {
-        size_t offset =
-            (Int32ConstantFrom(index) << TIMES_4) + data_offset;
+        size_t offset = (Int32ConstantFrom(index) << TIMES_4) + data_offset;
         GetAssembler()->StoreToOffset(kStoreWord, source, array, offset);
       } else {
         DCHECK(index.IsRegister()) << index;
@@ -6373,16 +6542,10 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
                                           RegisterFrom(index));
       }
 
-      if (!may_need_runtime_call_for_type_check) {
+      if (can_value_be_null || !needs_type_check) {
         // TODO(VIXL): Ensure we record the pc position immediately after the preceding store
         // instruction.
         codegen_->MaybeRecordImplicitNullCheck(instruction);
-      }
-
-      codegen_->MarkGCCard(temp1, temp2, array, value, instruction->GetValueCanBeNull());
-
-      if (done.IsReferenced()) {
-        __ Bind(&done);
       }
 
       if (slow_path != nullptr) {
@@ -8867,6 +9030,17 @@ CodeGeneratorARMVIXL::PcRelativePatchInfo* CodeGeneratorARMVIXL::NewPcRelativePa
   return &patches->back();
 }
 
+void CodeGeneratorARMVIXL::EmitEntrypointThunkCall(ThreadOffset32 entrypoint_offset) {
+  DCHECK(!__ AllowMacroInstructions());  // In ExactAssemblyScope.
+  DCHECK(!Runtime::Current()->UseJitCompilation());
+  call_entrypoint_patches_.emplace_back(/*dex_file*/ nullptr, entrypoint_offset.Uint32Value());
+  vixl::aarch32::Label* bl_label = &call_entrypoint_patches_.back().label;
+  __ bind(bl_label);
+  vixl32::Label placeholder_label;
+  __ bl(&placeholder_label);  // Placeholder, patched at link-time.
+  __ bind(&placeholder_label);
+}
+
 void CodeGeneratorARMVIXL::EmitBakerReadBarrierBne(uint32_t custom_data) {
   DCHECK(!__ AllowMacroInstructions());  // In ExactAssemblyScope.
   if (Runtime::Current()->UseJitCompilation()) {
@@ -8989,6 +9163,7 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
       /* MOVW+MOVT for each entry */ 2u * boot_image_string_patches_.size() +
       /* MOVW+MOVT for each entry */ 2u * string_bss_entry_patches_.size() +
       /* MOVW+MOVT for each entry */ 2u * boot_image_intrinsic_patches_.size() +
+      call_entrypoint_patches_.size() +
       baker_read_barrier_patches_.size();
   linker_patches->reserve(size);
   if (GetCompilerOptions().IsBootImage()) {
@@ -9013,6 +9188,11 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
       type_bss_entry_patches_, linker_patches);
   EmitPcRelativeLinkerPatches<linker::LinkerPatch::StringBssEntryPatch>(
       string_bss_entry_patches_, linker_patches);
+  for (const PatchInfo<vixl32::Label>& info : call_entrypoint_patches_) {
+    DCHECK(info.target_dex_file == nullptr);
+    linker_patches->push_back(linker::LinkerPatch::CallEntrypointPatch(
+        info.label.GetLocation(), info.offset_or_index));
+  }
   for (const BakerReadBarrierPatchInfo& info : baker_read_barrier_patches_) {
     linker_patches->push_back(linker::LinkerPatch::BakerReadBarrierBranchPatch(
         info.label.GetLocation(), info.custom_data));
@@ -9021,7 +9201,8 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
 }
 
 bool CodeGeneratorARMVIXL::NeedsThunkCode(const linker::LinkerPatch& patch) const {
-  return patch.GetType() == linker::LinkerPatch::Type::kBakerReadBarrierBranch ||
+  return patch.GetType() == linker::LinkerPatch::Type::kCallEntrypoint ||
+         patch.GetType() == linker::LinkerPatch::Type::kBakerReadBarrierBranch ||
          patch.GetType() == linker::LinkerPatch::Type::kCallRelative;
 }
 
@@ -9030,23 +9211,30 @@ void CodeGeneratorARMVIXL::EmitThunkCode(const linker::LinkerPatch& patch,
                                          /*out*/ std::string* debug_name) {
   arm::ArmVIXLAssembler assembler(GetGraph()->GetAllocator());
   switch (patch.GetType()) {
-    case linker::LinkerPatch::Type::kCallRelative:
+    case linker::LinkerPatch::Type::kCallRelative: {
       // The thunk just uses the entry point in the ArtMethod. This works even for calls
       // to the generic JNI and interpreter trampolines.
-      assembler.LoadFromOffset(
-          arm::kLoadWord,
-          vixl32::pc,
-          vixl32::r0,
-          ArtMethod::EntryPointFromQuickCompiledCodeOffset(kArmPointerSize).Int32Value());
+      MemberOffset offset = ArtMethod::EntryPointFromQuickCompiledCodeOffset(kArmPointerSize);
+      assembler.LoadFromOffset(arm::kLoadWord, vixl32::pc, vixl32::r0, offset.Int32Value());
       assembler.GetVIXLAssembler()->Bkpt(0);
       if (GetCompilerOptions().GenerateAnyDebugInfo()) {
         *debug_name = "MethodCallThunk";
       }
       break;
-    case linker::LinkerPatch::Type::kBakerReadBarrierBranch:
+    }
+    case linker::LinkerPatch::Type::kCallEntrypoint: {
+      assembler.LoadFromOffset(arm::kLoadWord, vixl32::pc, tr, patch.EntrypointOffset());
+      assembler.GetVIXLAssembler()->Bkpt(0);
+      if (GetCompilerOptions().GenerateAnyDebugInfo()) {
+        *debug_name = "EntrypointCallThunk_" + std::to_string(patch.EntrypointOffset());
+      }
+      break;
+    }
+    case linker::LinkerPatch::Type::kBakerReadBarrierBranch: {
       DCHECK_EQ(patch.GetBakerCustomValue2(), 0u);
       CompileBakerReadBarrierThunk(assembler, patch.GetBakerCustomValue1(), debug_name);
       break;
+    }
     default:
       LOG(FATAL) << "Unexpected patch type " << patch.GetType();
       UNREACHABLE();

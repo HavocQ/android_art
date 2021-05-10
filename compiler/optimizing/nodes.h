@@ -334,6 +334,7 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
         temporaries_vreg_slots_(0),
         has_bounds_checks_(false),
         has_try_catch_(false),
+        has_monitor_operations_(false),
         has_simd_(false),
         has_loops_(false),
         has_irreducible_loops_(false),
@@ -600,6 +601,9 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   bool HasTryCatch() const { return has_try_catch_; }
   void SetHasTryCatch(bool value) { has_try_catch_ = value; }
 
+  bool HasMonitorOperations() const { return has_monitor_operations_; }
+  void SetHasMonitorOperations(bool value) { has_monitor_operations_ = value; }
+
   bool HasSIMD() const { return has_simd_; }
   void SetHasSIMD(bool value) { has_simd_ = value; }
 
@@ -695,6 +699,10 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   // it up to date in the presence of code elimination so there might be
   // false positives.
   bool has_try_catch_;
+
+  // Flag whether there are any HMonitorOperation in the graph. If yes this will mandate
+  // DexRegisterMap to be present to allow deadlock analysis for non-debuggable code.
+  bool has_monitor_operations_;
 
   // Flag whether SIMD instructions appear in the graph. If true, the
   // code generators may have to be more careful spilling the wider
@@ -1438,6 +1446,7 @@ class HLoopInformationOutwardIterator : public ValueObject {
   M(Shr, BinaryOperation)                                               \
   M(StaticFieldGet, Instruction)                                        \
   M(StaticFieldSet, Instruction)                                        \
+  M(StringBuilderAppend, Instruction)                                   \
   M(UnresolvedInstanceFieldGet, Instruction)                            \
   M(UnresolvedInstanceFieldSet, Instruction)                            \
   M(UnresolvedStaticFieldGet, Instruction)                              \
@@ -4775,7 +4784,16 @@ class HInvokeVirtual final : public HInvoke {
       case Intrinsics::kThreadCurrentThread:
       case Intrinsics::kStringBufferAppend:
       case Intrinsics::kStringBufferToString:
-      case Intrinsics::kStringBuilderAppend:
+      case Intrinsics::kStringBuilderAppendObject:
+      case Intrinsics::kStringBuilderAppendString:
+      case Intrinsics::kStringBuilderAppendCharSequence:
+      case Intrinsics::kStringBuilderAppendCharArray:
+      case Intrinsics::kStringBuilderAppendBoolean:
+      case Intrinsics::kStringBuilderAppendChar:
+      case Intrinsics::kStringBuilderAppendInt:
+      case Intrinsics::kStringBuilderAppendLong:
+      case Intrinsics::kStringBuilderAppendFloat:
+      case Intrinsics::kStringBuilderAppendDouble:
       case Intrinsics::kStringBuilderToString:
         return false;
       default:
@@ -6880,6 +6898,55 @@ class HStaticFieldSet final : public HExpression<2> {
   const FieldInfo field_info_;
 };
 
+class HStringBuilderAppend final : public HVariableInputSizeInstruction {
+ public:
+  HStringBuilderAppend(HIntConstant* format,
+                       uint32_t number_of_arguments,
+                       ArenaAllocator* allocator,
+                       uint32_t dex_pc)
+      : HVariableInputSizeInstruction(
+            kStringBuilderAppend,
+            DataType::Type::kReference,
+            // The runtime call may read memory from inputs. It never writes outside
+            // of the newly allocated result object (or newly allocated helper objects).
+            SideEffects::AllReads().Union(SideEffects::CanTriggerGC()),
+            dex_pc,
+            allocator,
+            number_of_arguments + /* format */ 1u,
+            kArenaAllocInvokeInputs) {
+    DCHECK_GE(number_of_arguments, 1u);  // There must be something to append.
+    SetRawInputAt(FormatIndex(), format);
+  }
+
+  void SetArgumentAt(size_t index, HInstruction* argument) {
+    DCHECK_LE(index, GetNumberOfArguments());
+    SetRawInputAt(index, argument);
+  }
+
+  // Return the number of arguments, excluding the format.
+  size_t GetNumberOfArguments() const {
+    DCHECK_GE(InputCount(), 1u);
+    return InputCount() - 1u;
+  }
+
+  size_t FormatIndex() const {
+    return GetNumberOfArguments();
+  }
+
+  HIntConstant* GetFormat() {
+    return InputAt(FormatIndex())->AsIntConstant();
+  }
+
+  bool NeedsEnvironment() const override { return true; }
+
+  bool CanThrow() const override { return true; }
+
+  DECLARE_INSTRUCTION(StringBuilderAppend);
+
+ protected:
+  DEFAULT_COPY_CONSTRUCTOR(StringBuilderAppend);
+};
+
 class HUnresolvedInstanceFieldGet final : public HExpression<1> {
  public:
   HUnresolvedInstanceFieldGet(HInstruction* obj,
@@ -8051,6 +8118,10 @@ inline HInstruction* HuntForDeclaration(HInstruction* instruction) {
 void RemoveEnvironmentUses(HInstruction* instruction);
 bool HasEnvironmentUsedByOthers(HInstruction* instruction);
 void ResetEnvironmentInputRecords(HInstruction* instruction);
+
+// Detects an instruction that is >= 0. As long as the value is carried by
+// a single instruction, arithmetic wrap-around cannot occur.
+bool IsGEZero(HInstruction* instruction);
 
 }  // namespace art
 

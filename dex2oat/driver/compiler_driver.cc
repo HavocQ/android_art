@@ -62,6 +62,7 @@
 #include "gc/space/space.h"
 #include "handle_scope-inl.h"
 #include "intrinsics_enum.h"
+#include "intrinsics_list.h"
 #include "jni/jni_internal.h"
 #include "linker/linker_patch.h"
 #include "mirror/class-inl.h"
@@ -325,12 +326,6 @@ void CompilerDriver::CompileAll(jobject class_loader,
 
   CheckThreadPools();
 
-  if (GetCompilerOptions().IsBootImage()) {
-    // We don't need to setup the intrinsics for non boot image compilation, as
-    // those compilations will pick up a boot image that have the ArtMethod already
-    // set with the intrinsics flag.
-    InitializeIntrinsics();
-  }
   // Compile:
   // 1) Compile all classes and methods enabled for compilation. May fall back to dex-to-dex
   //    compilation.
@@ -838,6 +833,15 @@ static void EnsureVerifiedOrVerifyAtRuntime(jobject jclass_loader,
   }
 }
 
+void CompilerDriver::PrepareDexFilesForOatFile(TimingLogger* timings) {
+  compiled_classes_.AddDexFiles(GetCompilerOptions().GetDexFilesForOatFile());
+
+  if (GetCompilerOptions().IsAnyCompilationEnabled()) {
+    TimingLogger::ScopedTiming t2("Dex2Dex SetDexFiles", timings);
+    dex_to_dex_compiler_.SetDexFiles(GetCompilerOptions().GetDexFilesForOatFile());
+  }
+}
+
 void CompilerDriver::PreCompile(jobject class_loader,
                                 const std::vector<const DexFile*>& dex_files,
                                 TimingLogger* timings,
@@ -846,9 +850,6 @@ void CompilerDriver::PreCompile(jobject class_loader,
   CheckThreadPools();
 
   VLOG(compiler) << "Before precompile " << GetMemoryUsageString(false);
-
-  compiled_classes_.AddDexFiles(GetCompilerOptions().GetDexFilesForOatFile());
-  dex_to_dex_compiler_.SetDexFiles(GetCompilerOptions().GetDexFilesForOatFile());
 
   // Precompile:
   // 1) Load image classes.
@@ -1040,6 +1041,15 @@ class RecordImageClassesVisitor : public ClassVisitor {
   HashSet<std::string>* const image_classes_;
 };
 
+// Add classes which contain intrinsics methods to the list of image classes.
+static void AddClassesContainingIntrinsics(/* out */ HashSet<std::string>* image_classes) {
+#define ADD_INTRINSIC_OWNER_CLASS(_, __, ___, ____, _____, ClassName, ______, _______) \
+  image_classes->insert(ClassName);
+
+  INTRINSICS_LIST(ADD_INTRINSIC_OWNER_CLASS)
+#undef ADD_INTRINSIC_OWNER_CLASS
+}
+
 // Make a list of descriptors for classes to include in the image
 void CompilerDriver::LoadImageClasses(TimingLogger* timings,
                                       /*inout*/ HashSet<std::string>* image_classes) {
@@ -1049,6 +1059,16 @@ void CompilerDriver::LoadImageClasses(TimingLogger* timings,
   }
 
   TimingLogger::ScopedTiming t("LoadImageClasses", timings);
+
+  if (GetCompilerOptions().IsBootImage()) {
+    AddClassesContainingIntrinsics(image_classes);
+
+    // All intrinsics must be in the primary boot image, so we don't need to setup
+    // the intrinsics for any other compilation, as those compilations will pick up
+    // a boot image that have the ArtMethod already set with the intrinsics flag.
+    InitializeIntrinsics();
+  }
+
   // Make a first class to load all classes explicitly listed in the file
   Thread* self = Thread::Current();
   ScopedObjectAccess soa(self);
@@ -2073,7 +2093,7 @@ void CompilerDriver::SetVerifiedDexFile(jobject class_loader,
                                         ThreadPool* thread_pool,
                                         size_t thread_count,
                                         TimingLogger* timings) {
-  TimingLogger::ScopedTiming t("Verify Dex File", timings);
+  TimingLogger::ScopedTiming t("Set Verified Dex File", timings);
   if (!compiled_classes_.HaveDexFile(&dex_file)) {
     compiled_classes_.AddDexFile(&dex_file);
   }

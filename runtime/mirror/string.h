@@ -27,6 +27,7 @@ namespace art {
 
 template<class T> class Handle;
 template<class MirrorType> class ObjPtr;
+class StringBuilderAppend;
 struct StringOffsets;
 class StubTest_ReadBarrierForRoot_Test;
 
@@ -114,7 +115,7 @@ class MANAGED String final : public Object {
 
   ObjPtr<String> Intern() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template <bool kIsInstrumented>
+  template <bool kIsInstrumented = true>
   ALWAYS_INLINE static ObjPtr<String> AllocFromByteArray(Thread* self,
                                                          int32_t byte_length,
                                                          Handle<ByteArray> array,
@@ -123,7 +124,7 @@ class MANAGED String final : public Object {
                                                          gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  template <bool kIsInstrumented>
+  template <bool kIsInstrumented = true>
   ALWAYS_INLINE static ObjPtr<String> AllocFromCharArray(Thread* self,
                                                          int32_t count,
                                                          Handle<CharArray> array,
@@ -131,7 +132,7 @@ class MANAGED String final : public Object {
                                                          gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  template <bool kIsInstrumented>
+  template <bool kIsInstrumented = true>
   ALWAYS_INLINE static ObjPtr<String> AllocFromString(Thread* self,
                                                       int32_t string_length,
                                                       Handle<String> string,
@@ -139,7 +140,7 @@ class MANAGED String final : public Object {
                                                       gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  template <bool kIsInstrumented>
+  template <bool kIsInstrumented = true>
   ALWAYS_INLINE static ObjPtr<String> AllocEmptyString(Thread* self,
                                                        gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
@@ -248,7 +249,7 @@ class MANAGED String final : public Object {
     SetField32<false, false>(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), new_hash_code);
   }
 
-  template <bool kIsInstrumented, typename PreFenceVisitor>
+  template <bool kIsInstrumented = true, typename PreFenceVisitor>
   ALWAYS_INLINE static ObjPtr<String> Alloc(Thread* self,
                                             int32_t utf16_length_with_flag,
                                             gc::AllocatorType allocator_type,
@@ -269,6 +270,7 @@ class MANAGED String final : public Object {
     uint8_t value_compressed_[0];
   };
 
+  friend class art::StringBuilderAppend;
   friend struct art::StringOffsets;  // for verifying offset information
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(String);

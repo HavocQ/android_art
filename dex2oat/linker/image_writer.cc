@@ -254,6 +254,7 @@ bool ImageWriter::PrepareImageAddressSpace(TimingLogger* timings) {
   }
 
   {
+    TimingLogger::ScopedTiming t("PreloadDexCaches", timings);
     // Preload deterministic contents to the dex cache arrays we're going to write.
     ScopedObjectAccess soa(self);
     ObjPtr<mirror::ClassLoader> class_loader = GetAppClassLoader();
@@ -1354,10 +1355,6 @@ class ImageWriter::PruneObjectReferenceVisitor {
                                  ObjPtr<mirror::Reference> ref) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     operator()(ref, mirror::Reference::ReferentOffset(), /* is_static */ false);
-  }
-
-  ALWAYS_INLINE bool GetResult() const {
-    return result_;
   }
 
  private:
